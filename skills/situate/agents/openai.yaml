@@ -1,0 +1,4 @@
+interface:
+  display_name: "Situate"
+  short_description: "Catch up on what memory knows before resuming work"
+  default_prompt: "Get up to speed on this project from memory before we continue."

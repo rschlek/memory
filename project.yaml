@@ -1,0 +1,8 @@
+project: memory
+title: Memory
+summary: "Long-term memory skills for Claude Code and Codex on a Hindsight memory bank, for anyone whose agent keeps one."
+scope: personal
+tracking:
+memory:
+links:
+  repo: https://github.com/rschlek/memory
