@@ -42,7 +42,9 @@ scratch. This skill reads; it never writes to memory.
    "the user decided" or "CORRECTION"), and anything recent. If a phrasing
    misses, re-query with concrete names, identifiers, or dates. When the
    subject is wide and the harness supports subagents, readers can run recalls
-   in parallel and return quoted evidence with dates, not verdicts.
+   in parallel and return quoted evidence with dates, not verdicts. Have them
+   lean inclusive, say what they could not find, and keep raw recall payloads
+   to themselves so only cited findings reach the main context.
 
 5. **Other sources, only if the spec needs them.** The repository, working
    files, or a tracker for open items.

@@ -26,10 +26,12 @@ document; you gather, synthesize, and write one document.
 
 3. **Gather.** Use only the sources that fit: the web for external or current
    topics, local files for material the user already has, a codebase for "how
-   does this project do X", library documentation tools for a specific library
-   or API. If the harness supports subagents, research independent
-   sub-questions in parallel; size the effort to the question and tell the
-   user before starting a wide search.
+   does this project do X", and a connected documentation-lookup tool, when
+   there is one, for a specific library or API. If the harness supports
+   subagents, research independent sub-questions in parallel. Each research
+   agent is costly and a wide fan-out burns a large budget fast: a few agents
+   cover most topics, so say how many you will launch before starting, and go
+   wider only when the user asks.
 
 4. **Synthesize and show it.** One coherent synthesis: contradictions
    resolved, primary sources preferred, thin evidence called thin. Showing it

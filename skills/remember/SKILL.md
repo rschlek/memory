@@ -28,8 +28,9 @@ line.
 
 ## A document
 
-1. **Normalize to text.** Text, Markdown, and transcripts are used directly
-   (strip only cue numbers and timestamps). Read a PDF's text. For an image,
+1. **Normalize to text.** Text, Markdown, and transcripts (a `.vtt` file
+   included) are used directly (strip only cue numbers and timestamps, keep
+   every word). Read a PDF's text. For an image,
    write a faithful text description; that is the source text. Save the
    normalized text to a working file.
 

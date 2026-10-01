@@ -60,7 +60,8 @@ ingest it.
   it replaces something captured earlier.
 - In the text: attribute claims whose weight depends on it ("According to the
   planning meeting, ..."), and say whether something was read in a document or
-  done and verified.
+  done and verified. For a verbatim source the lead-in line carries the
+  attribution; do not rewrite the body to add it.
 
 ## 5. The `retain` call
 
