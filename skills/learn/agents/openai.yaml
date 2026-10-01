@@ -1,0 +1,4 @@
+interface:
+  display_name: "Learn"
+  short_description: "Research a topic and save the synthesis to memory"
+  default_prompt: "Learn about this topic and add it to memory."

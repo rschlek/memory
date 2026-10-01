@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sweep"
+  short_description: "Save what landed before the session closes"
+  default_prompt: "Sweep this session before we wrap."

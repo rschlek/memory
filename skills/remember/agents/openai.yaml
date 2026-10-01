@@ -1,0 +1,4 @@
+interface:
+  display_name: "Remember"
+  short_description: "Save a fact, decision, or document to memory"
+  default_prompt: "Remember this."

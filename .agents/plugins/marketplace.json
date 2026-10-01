@@ -1,0 +1,14 @@
+{
+  "name": "memory",
+  "interface": {
+    "displayName": "Memory (direct install)"
+  },
+  "plugins": [
+    {
+      "name": "memory",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

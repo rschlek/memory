@@ -1,0 +1,15 @@
+{
+  "name": "memory",
+  "owner": {
+    "name": "The memory plugin maintainers"
+  },
+  "description": "Single-plugin catalog so this repository can be installed directly.",
+  "plugins": [
+    {
+      "name": "memory",
+      "source": "./",
+      "description": "Long-term memory skills on a Hindsight memory bank: situate, remember, learn, sweep.",
+      "category": "productivity"
+    }
+  ]
+}
