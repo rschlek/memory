@@ -1,9 +1,9 @@
 {
   "name": "memory",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Long-term memory skills for a coding agent on a Hindsight memory bank: situate (catch up before work), remember and learn (save a source or a researched synthesis), and sweep (save what landed before a session closes).",
   "author": {
-    "name": "The memory plugin maintainers"
+    "name": "Rainier"
   },
   "repository": "https://github.com/rschlek/memory",
   "license": "MIT",
@@ -12,7 +12,7 @@
     "displayName": "Memory",
     "shortDescription": "Catch up, remember, research, and sweep with a Hindsight memory bank.",
     "longDescription": "Skills that use a Hindsight memory bank the environment already connects: situate loads what is known before work resumes, remember saves a stated fact or a handed-over document with its source, learn researches a topic and saves the synthesis marked as research, and sweep saves what landed before a session closes or compacts. The rules live in one backend-neutral conventions file and one Hindsight binding.",
-    "developerName": "The memory plugin maintainers",
+    "developerName": "Rainier",
     "category": "Productivity",
     "capabilities": [
       "Read",

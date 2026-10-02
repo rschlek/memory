@@ -34,10 +34,11 @@ copy. Fix a skill here, never in a consumer.
 Everything here is public and generic. Write for "the user" and "the memory
 bank". No person, username, host name, bank name, employer, team, or internal
 product; no absolute paths from any machine; no real tokens or memory content.
-The one exception is this repository's own URL. Anything specific to one
-environment (where the service runs, the MCP server's name, the bank, how to
-repair the service) belongs to that environment's own plugin or instructions,
-which tell the agent what to pass to these skills.
+The exceptions are the `author` field in the plugin manifests (and the owner
+of the single-plugin catalog) and this repository's own URL. Anything specific
+to one environment (where the service runs, the MCP server's name, the bank,
+how to repair the service) belongs to that environment's own plugin or
+instructions, which tell the agent what to pass to these skills.
 
 ### Layout
 
