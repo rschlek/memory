@@ -21,6 +21,13 @@ provenance, tags, dates), `capture-criteria.md` (how a source is written), and
 `hindsight-binding.md` (the Hindsight tools and what to do when memory is
 down).
 
+## Prerequisites
+
+Every skill in this plugin talks to a Hindsight memory bank through the
+Hindsight MCP server, so that server must be installed and configured for the
+agent before the skills will work. How the skills bind to it is described in
+`references/hindsight-binding.md`.
+
 ## Install
 
 From a catalog that lists this plugin, install `memory` from it. To install
