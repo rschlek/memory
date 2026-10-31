@@ -64,12 +64,19 @@ instructions, which tell the agent what to pass to these skills.
 - `references/`: `memory-conventions.md` (backend-neutral rules),
   `capture-criteria.md` (how a source is written), `hindsight-binding.md` (the
   Hindsight tools, which the skills call by name).
+- `hooks/`: opt-in hook scripts (transcript capture), their tests and test
+  data, and `hooks/README.md`. The user copies and wires them in themselves.
 
-### Two harnesses, no hooks
+### Two harnesses, no registered hooks
 
 Every skill must work in Claude Code and Codex from the same `SKILL.md`. Refer
 to bundled files by paths relative to the skill's directory, add no hooks, and
 keep skill bodies short and harness-neutral.
+
+The plugin registers no hook. `hooks/` holds scripts the user copies and wires
+in, and nothing runs until they do. Never add `hooks/hooks.json` or a `hooks`
+key to a manifest: Claude Code would load it for everyone who installs the
+plugin. Run the hook tests with `python -S -I hooks/test_transcript_capture.py`.
 
 ### Scripts
 
