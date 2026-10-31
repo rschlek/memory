@@ -56,6 +56,110 @@ Start a new session afterwards.
 - `~/.agent-memory/retains-owed-<date>.md`: saves that could not be written
   while memory was down, to be retained once it is back.
 
+## Transcript capture
+
+`hooks/` holds an optional hook. When a session stops, the hook saves the
+conversation text from that session (the user's messages and the assistant's
+prose, never tool calls or tool output) to a memory bank kept for transcripts.
+It sends ten turns at a time by default, all into one document per session,
+`session:<session_id>`. It reaches the memory service through an MCP door on an
+OpenAI-compatible gateway, using a key kept in a file. Installing the plugin
+does not turn it on. The plugin registers no hook, and the scripts do nothing
+until the user wires them in and writes a config with `enabled: true`. How it
+works, every config key, and its failure handling are in
+[hooks/README.md](hooks/README.md).
+
+Before wiring it in, the user needs:
+
+- a memory bank for transcripts, separate from the curated bank;
+- a door to that bank on the gateway that accepts a key and allows `retain`;
+- the key, alone in a file only the user can read.
+
+1. Copy `hooks/transcript_capture.py`, and for Codex also
+   `hooks/transcript_capture_codex.py`, to `~/.claude/hooks/`. Wire in the
+   copies, not the plugin folder: the plugin folder changes with every update.
+2. Write `~/.claude/transcript-capture.json`:
+
+   ```json
+   {
+     "enabled": true,
+     "gateway_url": "https://gateway.example.com/mcp/",
+     "mount": "transcripts",
+     "key_file": "~/.config/memory/transcripts.key",
+     "interval_turns": 10,
+     "projects_root": "~/projects",
+     "tags": [],
+     "device": "laptop",
+     "secret_files": ["~/.config/memory/*.key"],
+     "extra_metadata": {}
+   }
+   ```
+
+3. Preview what would be sent. This prints counts only, contacts nothing,
+   writes nothing, and works while `enabled` is still false:
+
+   ```bash
+   python -S -I ~/.claude/hooks/transcript_capture.py --catch-up --dry-run
+   ```
+
+4. Wire the Claude Code `Stop` hook in `~/.claude/settings.json`. Add it next to
+   any `Stop` hooks already there. `<python>` is the full path of a Python 3.9+
+   interpreter and `<home>` is the home folder, both written with forward
+   slashes:
+
+   ```json
+   "hooks": {
+     "Stop": [{"hooks": [{"type": "command", "command": "<python> -S -I <home>/.claude/hooks/transcript_capture.py", "timeout": 60, "async": true}]}]
+   }
+   ```
+
+   `async` keeps the agent from waiting on the network. The hook enforces its
+   own 15-second deadline on each exchange.
+
+5. For Codex, add a `Stop` hook to `~/.codex/config.toml`, then trust it once
+   in `/hooks`:
+
+   ```toml
+   [[hooks.Stop]]
+
+   [[hooks.Stop.hooks]]
+   type = "command"
+   command = "<python> -S -I <home>/.claude/hooks/transcript_capture_codex.py"
+   timeout = 60
+   ```
+
+   The same entry can also go in `~/.codex/hooks.json` as
+   `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 60}]}]}}`.
+   Check the hooks page of the installed Codex version for the exact form.
+
+6. Schedule the catch-up. It sends the last turns of sessions that ended
+   without another Stop, and replays retains that failed. Run it nightly, or
+   hourly; a run with nothing to do is cheap.
+
+   Windows Task Scheduler (one task per harness):
+
+   ```bat
+   schtasks /Create /SC DAILY /ST 03:30 /TN "transcript-capture" /TR "\"<python>\" -S -I \"<home>\.claude\hooks\transcript_capture.py\" --catch-up"
+   schtasks /Create /SC DAILY /ST 03:40 /TN "transcript-capture-codex" /TR "\"<python>\" -S -I \"<home>\.claude\hooks\transcript_capture_codex.py\" --catch-up"
+   ```
+
+   cron (Linux, macOS):
+
+   ```cron
+   30 3 * * * <python> -S -I $HOME/.claude/hooks/transcript_capture.py --catch-up
+   40 3 * * * <python> -S -I $HOME/.claude/hooks/transcript_capture_codex.py --catch-up
+   ```
+
+   A session the hook never saw is sent only if its file changed after
+   capture first ran on the device. To send older history on purpose, run the
+   catch-up once with `--backfill`, after a `--dry-run --backfill` preview.
+
+Retains that fail go to `~/.claude/transcript-capture/owed-<date>.jsonl`,
+and the next catch-up sends them, as does
+`transcript_capture.py --replay-owed`. To turn capture off, set
+`enabled` to false. To remove it, also delete the hook entries and the
+scheduled tasks.
+
 ## Data rule
 
 Never store credentials or secrets, and never store sensitive or restricted
