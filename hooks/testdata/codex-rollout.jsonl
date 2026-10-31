@@ -1,0 +1,15 @@
+{"timestamp":"2026-01-02T11:00:00.000Z","type":"session_meta","payload":{"id":"0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000","timestamp":"2026-01-02T11:00:00.000Z","cwd":"/home/user/projects/sample-repo","originator":"codex_cli","cli_version":"0.107.0","base_instructions":{"text":"system prompt that must not appear"}}}
+{"timestamp":"2026-01-02T11:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>\nmust not appear\n</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-01-02T11:02:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/x</cwd>\n</environment_context>"}]}}
+{"timestamp":"2026-01-02T11:03:00.000Z","type":"turn_context","payload":{"cwd":"/home/user/projects/sample-repo","model":"m","turn_id":"t1"}}
+{"timestamp":"2026-01-02T11:04:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Run the tests please."}]}}
+{"timestamp":"2026-01-02T11:04:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Run the tests please.","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-01-02T11:05:00.000Z","type":"response_item","payload":{"type":"reasoning","summary":[],"content":null,"encrypted_content":"xx"}}
+{"timestamp":"2026-01-02T11:05:00.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"reasoning that must not appear"}}
+{"timestamp":"2026-01-02T11:06:00.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"pytest\"]}","call_id":"c1"}}
+{"timestamp":"2026-01-02T11:07:00.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"tool output that must not appear"}}
+{"timestamp":"2026-01-02T11:08:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"All 12 tests pass."}]}}
+{"timestamp":"2026-01-02T11:08:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"All 12 tests pass.","phase":"final_answer"}}
+{"timestamp":"2026-01-02T11:09:00.000Z","type":"event_msg","payload":{"type":"token_count","info":null}}
+{"timestamp":"2026-01-02T11:10:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"Thanks, commit it.","images":[]}}
+{"timestamp":"2026-01-02T11:11:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Committed."}}
