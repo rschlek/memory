@@ -50,15 +50,25 @@ next user message. Assistant text with no user message before it (a reply to a
 background notification after the previous turn was sent) becomes a turn of its
 own, holding only that text.
 
-Each retain is rendered as plain text, in this form:
+Each retain is rendered as plain text. It starts with a header line that gives
+the batch's turn range, the first turn's time (UTC, to the minute) and the
+session id:
 
 ```
+## turns 11-20, 2026-01-02T20:58Z, session <session_id>
+
 user: <message>
 
 assistant: <reply>
 
 user: ...
 ```
+
+The turn range is in the text, not in the metadata, because the memory service
+applies a retain's metadata to the whole document and to every unit in it. A
+per-batch value there would be overwritten on every earlier unit by each
+append. The header keeps the range in the verbatim text, and in the context
+of every chunk near it.
 
 ## When it sends
 
@@ -90,11 +100,11 @@ One MCP `tools/call` per batch of turns, with these arguments:
 
 | Argument | Value |
 | --- | --- |
-| `content` | the rendered turns, scrubbed |
+| `content` | the header line, then the rendered turns, scrubbed |
 | `document_id` | `session:<session_id>` |
 | `update_mode` | `append` |
 | `tags` | the configured `tags`, plus `project:<name>` when the session's working folder is under `projects_root` (`<name>` is the first folder below the root, lower-cased, so a worktree counts as its repository) |
-| `metadata` | `extra_metadata`, then `device`, `harness` (`claude-code` or `codex`), `session`, `kind: transcript`, and `turns` (for example `11-20`); all values are strings |
+| `metadata` | `extra_metadata`, then `device`, `harness` (`claude-code` or `codex`), `session` and `kind: transcript`; all values are strings, and all are constant for a session, since metadata applies to the whole document |
 | `context` | `verbatim transcript of an agent session, conversation text only` |
 | `timestamp` | the first turn's timestamp, when the session file has one |
 
@@ -130,12 +140,23 @@ Nothing raises into the harness. The script always exits 0 and prints nothing
 (except in dry-run mode).
 
 - **Failed retain** (connection, HTTP status, JSON-RPC error, a tool error, a
-  timeout, an unreadable key). The full arguments of the retain go to
+  result that reports an error status or `success: false`, a timeout, an
+  unreadable key). The full arguments of the retain go to
   `owed-<date>.jsonl` with the reason. The turns count as handled, so they are
   never sent twice, and that run stops sending. `--replay-owed`, and the start
   of every catch-up, resend the owed retains. Whatever still fails goes back
   into an owed file. Replayed batches can land out of order in the document;
-  `metadata.turns` gives each one's place.
+  each batch's header line gives its place.
+- **What counts as success.** An accepted retain counts, and so does a
+  pending or completed status. A missing or small unit count does not mean
+  failure. The service can merge queued appends into one batch: then the
+  operation for the second append reports no unit count, and the first
+  reports a misleading one. Only an error status or a transport failure sends
+  a batch to the owed file. To check a batch by hand, look up its operation
+  id (kept in the cursor's `ops`) and expect `completed`.
+- **Appends re-chunk the tail.** The service re-chunks the end of the
+  document on each append, so a few units at each batch boundary are embedded
+  again. That costs embedding time only; no text is lost or duplicated.
 - **Any other error** adds one line to `capture.log`, which never holds text
   or keys and rolls over at 512 KB.
 - **Overlap.** A per-session lock file keeps a Stop and a catch-up from
@@ -190,7 +211,7 @@ directly. Both scripts read the same file. When the file is missing or
 | `secret_files` | `[]` | Globs of files whose values are redacted (`~` is expanded). |
 | `scrub_patterns` | built in | A list of regular expressions that replaces the default token patterns. An expression that does not compile is skipped and logged. |
 | `scrub_whole_line` | `false` | Redact the whole line that matches, instead of only the match. |
-| `extra_metadata` | `{}` | More metadata, as strings. It cannot override `device`, `harness`, `session`, `kind` or `turns`. |
+| `extra_metadata` | `{}` | More metadata, as strings. It cannot override `device`, `harness`, `session` or `kind`. Metadata applies to the whole document, so keep these values constant. |
 | `timeout_s` | `15` | Deadline for one whole MCP exchange, in seconds. |
 | `catch_up_idle_min` | `30` | Minutes a session file must be untouched before the catch-up sends its newest turn. |
 

@@ -10,6 +10,7 @@ Fake tokens are assembled at run time so none appears literally in this file.
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -58,6 +59,7 @@ class Stub(object):
 
     def __init__(self, sse=False):
         self.sse = sse
+        self.call_result = None  # JSON text the retain tool returns; default: accepted
         self.requests = []
         self.calls = []
         stub = self
@@ -88,8 +90,9 @@ class Stub(object):
                 elif method == "tools/call":
                     stub.calls.append(body["params"])
                     op = "op-%d" % len(stub.calls)
-                    self.reply(body, {"content": [{"type": "text", "text": json.dumps(
-                        {"success": True, "operation_id": op})}], "isError": False})
+                    text = stub.call_result or json.dumps({"success": True, "operation_id": op})
+                    self.reply(body, {"content": [{"type": "text", "text": text}],
+                                      "isError": False})
                 else:
                     self.reply(body, None, error={"code": -32601, "message": "no such method"})
 
@@ -210,6 +213,17 @@ def read_json(path):
     return json.loads(read_text(path))
 
 
+def turns_of(args):
+    """The turn range from a sent batch's header line."""
+    m = re.match(r"## turns (\d+-\d+), \d{4}-\d\d-\d\dT\d\d:\d\dZ, session \S+\n\n", args["content"])
+    assert m, args["content"][:80]
+    return m.group(1)
+
+
+def body_of(args):
+    return args["content"].split("\n\n", 1)[1]
+
+
 def parse_all(path, events_fn):
     cur = {"session_id": "s", "offset": 0, "pending": []}
     tc.advance(cur, path, events_fn)
@@ -305,7 +319,7 @@ class IntervalTests(Base):
         sent, sender = self.fake_sender()
         tc.process_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code", sender=sender)
         self.assertEqual(len(sent), 1)  # 4 turns read, 3 complete, interval 3
-        self.assertEqual(sent[0]["metadata"]["turns"], "1-3")
+        self.assertEqual(turns_of(sent[0]), "1-3")
         cur = tc.load_cursor(CLAUDE_SID, path, "claude-code")
         self.assertEqual(cur["turns_sent"], 3)
         self.assertEqual(len(cur["pending"]), 1)
@@ -317,8 +331,8 @@ class IntervalTests(Base):
         tc.process_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code", force=True,
                            sender=sender)
         self.assertEqual(len(sent), 2)
-        self.assertEqual(sent[1]["metadata"]["turns"], "4-4")
-        self.assertTrue(sent[1]["content"].startswith("user: A question from an older"))
+        self.assertEqual(turns_of(sent[1]), "4-4")
+        self.assertTrue(body_of(sent[1]).startswith("user: A question from an older"))
 
     def test_below_interval_sends_nothing(self):
         cfg = self.write_config("http://unused", interval_turns=10)
@@ -336,7 +350,7 @@ class IntervalTests(Base):
         sent, sender = self.fake_sender()
         tc.process_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code", force=True,
                            sender=sender)
-        self.assertEqual([a["metadata"]["turns"] for a in sent], ["1-3", "4-4"])
+        self.assertEqual([turns_of(a) for a in sent], ["1-3", "4-4"])
 
     def test_retain_arguments(self):
         cfg = self.write_config("http://unused", interval_turns=1)
@@ -349,7 +363,9 @@ class IntervalTests(Base):
         self.assertEqual(a["tags"], ["group:example", "project:sample-repo"])
         self.assertEqual(a["metadata"], {"site": "lab", "device": "test-device",
                                          "harness": "claude-code", "session": CLAUDE_SID,
-                                         "kind": "transcript", "turns": "1-1"})
+                                         "kind": "transcript"})
+        self.assertTrue(a["content"].startswith(
+            "## turns 1-1, 2026-01-02T10:01Z, session %s\n\nuser: Please list" % CLAUDE_SID))
         self.assertEqual(a["context"], tc.CONTEXT)
         self.assertEqual(a["timestamp"], "2026-01-02T10:01:00.000Z")
 
@@ -440,6 +456,36 @@ class McpClientTests(Base):
                                                        "text": "accepted, operation_id: c-1"}]}), "c-1")
         self.assertIsNone(tc.operation_id({"content": []}))
 
+    def test_unit_counts_do_not_decide_success(self):
+        ok_shapes = [
+            {"operation_id": "a", "status": "completed"},  # merged batch: no unit count
+            {"operation_id": "b", "status": "completed", "units": 0},
+            {"operation_id": "c", "status": "pending"},
+            {"success": True, "operation_id": "d", "items_count": 1},
+        ]
+        for shape in ok_shapes:
+            self.assertIsNone(tc.retain_failure(
+                {"content": [{"type": "text", "text": json.dumps(shape)}]}), shape)
+        for shape in ({"operation_id": "e", "status": "failed"},
+                      {"result": {"status": "ERROR"}}, {"success": False}):
+            self.assertIsNotNone(tc.retain_failure(
+                {"content": [{"type": "text", "text": json.dumps(shape)}]}), shape)
+        self.assertIsNotNone(tc.retain_failure({"structuredContent": {"status": "failed"}}))
+        self.assertIsNone(tc.retain_failure({"content": [{"type": "text", "text": "accepted"}]}))
+
+    def test_error_status_goes_to_owed_file(self):
+        stub = self.stub()
+        stub.call_result = json.dumps({"operation_id": "op-x", "status": "failed"})
+        cfg = self.write_config(stub.url, interval_turns=1)
+        path = self.copy_session()
+        tc.process_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code")
+        owed = [n for n in os.listdir(self.state()) if n.startswith("owed-")]
+        self.assertEqual(len(owed), 1)
+        rec = json.loads(read_text(self.state(owed[0])).splitlines()[0])
+        self.assertEqual(rec["error"], "service reported status failed")
+        stub.call_result = json.dumps({"operation_id": "op-y", "status": "completed"})
+        self.assertEqual(tc.replay_owed(cfg), (1, 0))
+
     def test_missing_key_file_fails_cleanly(self):
         cfg = self.write_config("http://unused", key_file=os.path.join(self.tmp, "nope"))
         ok, why = tc.send(cfg, {"content": "x"})
@@ -462,7 +508,7 @@ class HookEndToEndTests(Base):
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
         self.assertEqual(len(stub.calls), 1)
         args = stub.calls[0]["arguments"]
-        self.assertEqual(args["metadata"]["turns"], "1-2")
+        self.assertEqual(turns_of(args), "1-2")
         self.assertIn("project:sample-repo", args["tags"])
         cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
         self.assertEqual(cur["last_operation_id"], "op-1")
@@ -486,7 +532,7 @@ class HookEndToEndTests(Base):
         self.assertEqual(len(recs), 1)  # one failure stops the run
         self.assertEqual(recs[0]["arguments"]["document_id"], "session:" + CLAUDE_SID)
         self.assertEqual(recs[0]["arguments"]["update_mode"], "append")
-        self.assertTrue(recs[0]["arguments"]["content"].startswith("user: Please list"))
+        self.assertTrue(body_of(recs[0]["arguments"]).startswith("user: Please list"))
         self.assertIn("connection failed", recs[0]["error"])
         cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
         self.assertEqual((cur["turns_sent"], cur["owed_batches"]), (1, 1))
@@ -499,7 +545,7 @@ class HookEndToEndTests(Base):
         r = self.run_script("transcript_capture.py", args=["--replay-owed"])
         self.assertEqual(r.returncode, 0)
         self.assertEqual(len(stub.calls), 1)
-        self.assertEqual(stub.calls[0]["arguments"]["metadata"]["turns"], "1-1")
+        self.assertEqual(turns_of(stub.calls[0]["arguments"]), "1-1")
         self.assertEqual([n for n in os.listdir(self.state()) if n.startswith("owed-")], [])
 
     def test_missing_or_disabled_config_is_silent(self):
@@ -535,7 +581,8 @@ class HookEndToEndTests(Base):
         args = stub.calls[0]["arguments"]
         self.assertEqual(args["document_id"], "session:" + CODEX_SID)
         self.assertEqual(args["metadata"]["harness"], "codex")
-        self.assertEqual(args["content"], "user: Run the tests please.\n\nassistant: All 12 tests pass.")
+        self.assertEqual(args["content"], "## turns 1-1, 2026-01-02T11:04Z, session %s\n\n"
+                         "user: Run the tests please.\n\nassistant: All 12 tests pass." % CODEX_SID)
         self.assertIn("project:sample-repo", args["tags"])
 
 
@@ -562,7 +609,7 @@ class CatchUpTests(Base):
         self.assertEqual(len(stub.calls), 1)  # the recent file is not idle yet
         args = stub.calls[0]["arguments"]
         self.assertEqual(args["document_id"], "session:" + CLAUDE_SID)
-        self.assertEqual(args["metadata"]["turns"], "1-4")
+        self.assertEqual(turns_of(args), "1-4")
         self.assertTrue(os.path.isfile(self.state("last-catch-up-claude-code")))
         # A later night: the recent file has gone idle and is newer than the stamp.
         with open(self.state("last-catch-up-claude-code"), "w") as f:
@@ -592,7 +639,7 @@ class CatchUpTests(Base):
         r = self.run_script("transcript_capture.py", args=["--catch-up"])
         self.assertEqual(r.returncode, 0)
         self.assertEqual(len(stub.calls), 1)
-        self.assertEqual(stub.calls[0]["arguments"]["metadata"]["turns"], "1-4")
+        self.assertEqual(turns_of(stub.calls[0]["arguments"]), "1-4")
 
     def test_dry_run_reports_counts_only(self):
         self.write_config(dead_url(), enabled=False)

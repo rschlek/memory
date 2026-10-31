@@ -353,10 +353,33 @@ def project_name(cwd, projects_root):
     return c[len(r)].lower()
 
 
+def header_time(ts):
+    """A turn timestamp as UTC to the minute (2026-10-31T20:58Z); now when absent."""
+    import datetime
+    utc = datetime.timezone.utc
+    when = None
+    if ts:
+        try:
+            when = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=utc)
+        except ValueError:
+            when = None
+    return (when or datetime.datetime.now(utc)).astimezone(utc).strftime("%Y-%m-%dT%H:%MZ")
+
+
+def batch_header(first_turn, last_turn, ts, session_id):
+    """First line of every sent batch. The memory service applies a retain's
+    metadata to the whole document, so the turn range lives in the text."""
+    return "## turns %d-%d, %s, session %s" % (first_turn, last_turn, header_time(ts), session_id)
+
+
 def build_retain(cfg, cur, turns, first_turn, harness):
     text = scrub(render(turns), cfg)
     if not text.strip():
         return None
+    text = batch_header(first_turn, first_turn + len(turns) - 1, turns[0].get("ts"),
+                        cur["session_id"]) + "\n\n" + text
     tags = [str(t) for t in cfg.get("tags") or []]
     proj = project_name(cur.get("cwd"), cfg.get("projects_root"))
     if proj:
@@ -365,11 +388,12 @@ def build_retain(cfg, cur, turns, first_turn, harness):
     meta = {str(k): str(v) for k, v in (cfg.get("extra_metadata") or {}).items()}
     if cfg.get("device"):
         meta["device"] = str(cfg["device"])
+    # The service applies metadata to the document and to every unit in it, so
+    # only values that are constant for the session belong here.
     meta.update({
         "harness": harness,
         "session": cur["session_id"],
         "kind": "transcript",
-        "turns": "%d-%d" % (first_turn, first_turn + len(turns) - 1),
     })
     args = {
         "content": text,
@@ -588,10 +612,41 @@ def operation_id(result):
     return None
 
 
+FAILED_STATUSES = ("failed", "failure", "error", "errored")
+
+
+def retain_failure(result):
+    """The reason when the tool result reports an explicit failure, else None.
+    A missing or small unit count is not a failure: when the service merges
+    queued appends into one batch, one operation reports no units and another
+    a misleading count. Only an error status (or success: false) counts."""
+    payloads = [result.get("structuredContent")]
+    for c in result.get("content") or []:
+        text = c.get("text") if isinstance(c, dict) else None
+        if text:
+            try:
+                payloads.append(json.loads(text))
+            except ValueError:
+                pass
+    for p in payloads:
+        if not isinstance(p, dict):
+            continue
+        if p.get("success") is False:
+            return "service reported success: false"
+        status = _find_key(p, ("status",))
+        if status and status.strip().lower() in FAILED_STATUSES:
+            return "service reported status %s" % status.strip().lower()
+    return None
+
+
 def send(cfg, arguments):
     """(True, operation_id or "") on success, (False, reason) on any failure."""
     try:
-        return True, operation_id(mcp_call_tool(cfg, arguments)) or ""
+        result = mcp_call_tool(cfg, arguments)
+        failure = retain_failure(result)
+        if failure:
+            return False, failure
+        return True, operation_id(result) or ""
     except McpError as e:
         return False, str(e)
     except Exception as e:  # never raise into the harness
@@ -725,13 +780,14 @@ def flush(cfg, cur, force, harness, sender=None):
         turns = cur["pending"][:n]
         first = int(cur.get("turns_sent") or 0) + 1
         args = build_retain(cfg, cur, turns, first, harness)
+        span = "%d-%d" % (first, first + n - 1)
         failed = False
         if args is not None:
             ok, info = sender(cfg, args)
             if ok:
                 cur["last_operation_id"] = info or None
                 cur["ops"] = (cur.get("ops") or [])[-(KEEP_OPS - 1):] + [
-                    {"op": info, "turns": args["metadata"]["turns"]}]
+                    {"op": info, "turns": span}]
             else:
                 write_owed(args, info, harness)
                 cur["owed_batches"] = int(cur.get("owed_batches") or 0) + 1
