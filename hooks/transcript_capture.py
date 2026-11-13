@@ -9,11 +9,20 @@ detached worker that sends them as one `retain` to the memory service through
 an MCP door on a gateway, and returns without waiting for it. All of a
 session's text lands in one document, `session:<session_id>`, by appending.
 
+A `SessionEnd` hook (`--session-end`) starts a worker that sends the rest of
+the session, and about once an hour a Stop also has its worker sweep: send the
+unsent tail of every idle session this harness's hook has seen (one that ended
+without a SessionEnd: a closed window, a crash, a machine put to sleep). No
+scheduler is needed.
+
 Modes:
   (no argument)    Stop hook: read the event JSON on stdin. Never touches the
                    network itself.
-  --worker         The detached process the hook starts (--session, --transcript,
-                   --cwd, --force). Sends what is due, then replays owed retains.
+  --session-end    SessionEnd hook: read the event JSON on stdin and start a
+                   worker that sends everything unsent, the newest turn too.
+  --worker         The detached process the hooks start (--session, --transcript,
+                   --cwd, --force, --sweep). Sends what is due, replays owed
+                   retains, and with --sweep sends idle sessions' tails.
   --catch-up       By hand: send what is unsent for every session file idle for
                    `catch_up_idle_min` minutes, ignoring the interval. Replays
                    owed retains first.
@@ -53,6 +62,9 @@ REDACTED_LINE = "[redacted line]"
 MAX_BATCHES_PER_STOP = 3
 LOCK_STALE_S = 120
 LOCK_WAIT_S = 60  # how long a worker waits for a session another process is sending
+SWEEP_EVERY_S = 3600  # a Stop starts a sweep at most this often, per harness
+SWEEP_MAX_BATCHES = 20  # batches one sweep sends at most; the rest waits for the next
+SWEEP_LOOKBACK_S = 30 * 86400  # older cursors are left to a catch-up by hand
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_SECRET_FILE_BYTES = 256 * 1024
 MIN_SECRET_LEN = 16
@@ -948,27 +960,92 @@ def spawn_worker(script, args):
 
 
 def run_worker(cfg, harness, events_fn, session_id, path, cwd=None, force=False,
-               sender=None):
-    """Send what is due for one session; then, when the door answered, replay the
-    owed retains. Waits up to LOCK_WAIT_S for a session another process holds."""
-    failed = False
+               sweep=False, sender=None):
+    """Send what is due for one session; then, as long as the door answers, replay
+    the owed retains and, with sweep, send the tails of idle sessions. Waits up to
+    LOCK_WAIT_S for a session another process holds."""
     if session_id and path and os.path.isfile(path):
         _, failed = process_session(cfg, session_id, path, events_fn, harness, force=force,
                                     cwd=cwd, sender=sender, wait_s=LOCK_WAIT_S)
-    if not failed and owed_files():
-        replay_owed(cfg, sender)
+        if failed:
+            return
+    if owed_files():
+        _, still_owed = replay_owed(cfg, sender)
+        if still_owed:
+            return
+    if sweep:
+        sweep_idle(cfg, harness, events_fn, sender)
+
+
+def claim_sweep(harness):
+    """True at most once per SWEEP_EVERY_S for a harness; the caller then sweeps."""
+    stamp = os.path.join(state_dir(), "last-sweep-%s" % harness)
+    try:
+        if time.time() - os.path.getmtime(stamp) < SWEEP_EVERY_S:
+            return False
+    except OSError:
+        pass
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        with open(stamp, "w", encoding="utf-8") as f:
+            f.write(repr(time.time()))
+    except OSError:
+        return False
+    return True
+
+
+def sweep_idle(cfg, harness, events_fn, sender=None):
+    """Send the unsent tail, the newest turn included, of every session this
+    harness's hook has seen whose file has been idle for catch_up_idle_min
+    minutes: sessions that ended without a SessionEnd. Newest cursors first, at
+    most SWEEP_MAX_BATCHES batches, stopping at the first failure. Returns the
+    batches sent."""
+    now = time.time()
+    idle_s = float(cfg.get("catch_up_idle_min") or 30) * 60
+    cursors = []
+    for cpath in glob.glob(os.path.join(state_dir(), "cursors", "*.json")):
+        try:
+            cursors.append((os.path.getmtime(cpath), cpath))
+        except OSError:
+            pass
+    budget = SWEEP_MAX_BATCHES
+    for mtime, cpath in sorted(cursors, reverse=True):
+        if budget <= 0 or now - mtime > SWEEP_LOOKBACK_S:
+            break
+        try:
+            with open(cpath, encoding="utf-8") as f:
+                cur = json.load(f)
+            if not isinstance(cur, dict) or cur.get("harness") != harness:
+                continue
+            sid, path = cur.get("session_id"), cur.get("transcript_path")
+            if not sid or not path or not os.path.isfile(path):
+                continue
+            if now - os.path.getmtime(path) < idle_s:
+                continue  # still active
+            if not cur.get("pending") and int(cur.get("offset") or 0) >= os.path.getsize(path):
+                continue  # all sent
+            batches, failed = process_session(cfg, sid, path, events_fn, harness, force=True,
+                                              sender=sender, limit=budget)
+            budget -= batches
+            if failed:
+                break
+        except Exception as e:
+            log("sweep %s: %s" % (os.path.basename(cpath), type(e).__name__))
+    return SWEEP_MAX_BATCHES - budget
 
 
 def start_worker(cfg, harness, events_fn, session_id, path, cwd, force, script,
-                 spawner=None):
+                 spawner=None, sweep=False):
     if os.environ.get("TRANSCRIPT_CAPTURE_INLINE") == "1":
-        run_worker(cfg, harness, events_fn, session_id, path, cwd, force)
+        run_worker(cfg, harness, events_fn, session_id, path, cwd, force, sweep)
         return
     args = ["--worker", "--session", session_id, "--transcript", path]
     if cwd:
         args += ["--cwd", cwd]
     if force:
         args.append("--force")
+    if sweep:
+        args.append("--sweep")
     (spawner or spawn_worker)(script or os.path.abspath(__file__), args)
 
 
@@ -1036,9 +1113,12 @@ def catch_up(cfg, harness, files, session_id_fn, events_fn, dry_run=False, sende
     return done
 
 
-def hook(stdin_text, harness, events_fn, session_id_fn=None, script=None, spawner=None):
-    """Stop hook body: read the new lines; when a batch is due, start a detached
-    worker to send it. Never raises, never prints, never waits on the network."""
+def hook(stdin_text, harness, events_fn, session_id_fn=None, script=None, spawner=None,
+         session_end=False):
+    """Stop hook body: read the new lines; when a batch or a sweep is due, start a
+    detached worker. SessionEnd (session_end): start a worker that sends the rest,
+    reading nothing here, since harnesses give SessionEnd hooks a second or two.
+    Never raises, never prints, never waits on the network."""
     try:
         cfg = load_config()
         if not cfg:
@@ -1054,8 +1134,14 @@ def hook(stdin_text, harness, events_fn, session_id_fn=None, script=None, spawne
         if not sid:
             return 0
         sid, cwd = str(sid), data.get("cwd") or None
-        if note_session(cfg, sid, path, events_fn, harness, cwd) >= cfg["interval_turns"]:
-            start_worker(cfg, harness, events_fn, sid, path, cwd, False, script, spawner)
+        if session_end:
+            start_worker(cfg, harness, events_fn, sid, path, cwd, True, script, spawner)
+            return 0
+        due = note_session(cfg, sid, path, events_fn, harness, cwd) >= cfg["interval_turns"]
+        sweep = claim_sweep(harness)
+        if due or sweep:
+            start_worker(cfg, harness, events_fn, sid, path, cwd, False, script, spawner,
+                         sweep=sweep)
     except Exception as e:
         log("hook error %s: %s" % (type(e).__name__, str(e)[:200]))
     return 0
@@ -1077,7 +1163,7 @@ def main(argv, harness=HARNESS, events_fn=claude_events, files_fn=claude_session
             if cfg:
                 run_worker(cfg, harness, events_fn, _opt(argv, "--session"),
                            _opt(argv, "--transcript"), _opt(argv, "--cwd"),
-                           force="--force" in argv)
+                           force="--force" in argv, sweep="--sweep" in argv)
             return 0
         if "--catch-up" in argv or "--replay-owed" in argv:
             dry = "--dry-run" in argv
@@ -1091,7 +1177,8 @@ def main(argv, harness=HARNESS, events_fn=claude_events, files_fn=claude_session
                 replay_owed(cfg)
             return 0
         return hook(sys.stdin.read(), harness, events_fn, hook_session_id_fn,
-                    script=script or os.path.abspath(__file__))
+                    script=script or os.path.abspath(__file__),
+                    session_end="--session-end" in argv)
     except Exception as e:
         log("error %s: %s" % (type(e).__name__, str(e)[:200]))
         return 0

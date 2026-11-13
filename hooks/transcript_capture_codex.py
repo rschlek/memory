@@ -2,10 +2,11 @@
 """Codex adapter for transcript_capture.py: the same cursor, scrub, and sender,
 reading Codex session files instead of Claude Code ones.
 
-Wire it as a Codex `Stop` hook (silent exit 0 is a no-op for Codex). Like the
-Claude Code script, the hook only reads and starts a detached worker (this same
-script, `--worker`) when a batch is due, so the turn never waits on the network;
-`--catch-up` and `--replay-owed` are run by hand. It shares the config file
+Wire it as a Codex `Stop` hook and a `SessionEnd` hook with `--session-end`
+(silent exit 0 is a no-op for Codex). Like the Claude Code script, the hook
+only reads and starts a detached worker (this same script, `--worker`) when a
+batch or a sweep is due, so the turn never waits on the network; `--catch-up`
+and `--replay-owed` are run by hand. It shares the config file
 (~/.claude/transcript-capture.json, or $TRANSCRIPT_CAPTURE_CONFIG) and the state
 folder with the Claude Code script; metadata says "harness": "codex".
 

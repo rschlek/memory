@@ -110,16 +110,20 @@ Before wiring it in, the user needs:
 
    ```json
    "hooks": {
-     "Stop": [{"hooks": [{"type": "command", "command": "<python> -S -I <home>/.claude/hooks/transcript_capture.py", "timeout": 60, "async": true}]}]
+     "Stop": [{"hooks": [{"type": "command", "command": "<python> -S -I <home>/.claude/hooks/transcript_capture.py", "timeout": 60, "async": true}]}],
+     "SessionEnd": [{"hooks": [{"type": "command", "command": "<python> -S -I <home>/.claude/hooks/transcript_capture.py --session-end", "timeout": 10}]}]
    }
    ```
 
    The hook only reads the session file; when a batch is due it starts a
    detached worker that does the sending, with its own 15-second deadline on
    each exchange. `async` is a second guard against the agent ever waiting.
+   The `SessionEnd` entry sends the rest of the session when it ends; its
+   hook only starts a worker, well inside the harness's short SessionEnd
+   budget.
 
-5. For Codex, add a `Stop` hook to `~/.codex/config.toml`, then trust it once
-   in `/hooks`:
+5. For Codex, add a `Stop` and a `SessionEnd` hook to `~/.codex/config.toml`,
+   then trust them once in `/hooks`:
 
    ```toml
    [[hooks.Stop]]
@@ -128,6 +132,13 @@ Before wiring it in, the user needs:
    type = "command"
    command = "<python> -S -I <home>/.claude/hooks/transcript_capture_codex.py"
    timeout = 10
+
+   [[hooks.SessionEnd]]
+
+   [[hooks.SessionEnd.hooks]]
+   type = "command"
+   command = "<python> -S -I <home>/.claude/hooks/transcript_capture_codex.py --session-end"
+   timeout = 3
    ```
 
    Codex waits for a hook to finish, so the short timeout is only a bound:
@@ -136,33 +147,19 @@ Before wiring it in, the user needs:
    `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 10}]}]}}`.
    Check the hooks page of the installed Codex version for the exact form.
 
-6. Optionally, schedule the catch-up. The hook sends full batches only, so
-   the last turns of a session (fewer than `interval_turns`) wait for a
-   catch-up. Run it nightly, or hourly; a run with nothing to do is cheap.
-
-   Windows Task Scheduler (one task per harness):
-
-   ```bat
-   schtasks /Create /SC DAILY /ST 03:30 /TN "transcript-capture" /TR "\"<python>\" -S -I \"<home>\.claude\hooks\transcript_capture.py\" --catch-up"
-   schtasks /Create /SC DAILY /ST 03:40 /TN "transcript-capture-codex" /TR "\"<python>\" -S -I \"<home>\.claude\hooks\transcript_capture_codex.py\" --catch-up"
-   ```
-
-   cron (Linux, macOS):
-
-   ```cron
-   30 3 * * * <python> -S -I $HOME/.claude/hooks/transcript_capture.py --catch-up
-   40 3 * * * <python> -S -I $HOME/.claude/hooks/transcript_capture_codex.py --catch-up
-   ```
-
-   A session the hook never saw is sent only if its file changed after
-   capture first ran on the device. To send older history on purpose, run the
-   catch-up once with `--backfill`, after a `--dry-run --backfill` preview.
+6. Nothing needs scheduling. The Stop hook sends full batches, the
+   SessionEnd hook sends the rest, and about once an hour a Stop sweeps up
+   the rest of any session that ended without a SessionEnd. `--catch-up` is
+   a tool to run by hand. A session the hook never saw is sent only if its
+   file changed after capture first ran on the device. To send older history
+   on purpose, run the catch-up once with `--backfill`, after a
+   `--dry-run --backfill` preview.
 
 Retains that fail go to `~/.claude/transcript-capture/owed-<date>.jsonl`.
 The next worker that reaches the door sends them, and so do a catch-up and
 `transcript_capture.py --replay-owed`. To turn capture off, set
-`enabled` to false. To remove it, also delete the hook entries and the
-scheduled tasks.
+`enabled` to false. To remove it, also delete the hook entries (and any
+catch-up task an earlier version had you schedule).
 
 ## Data rule
 

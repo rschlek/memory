@@ -614,6 +614,9 @@ class TurnCounterTests(Base):
         os.environ.pop("TRANSCRIPT_CAPTURE_INLINE", None)
         self.spawned = []
         self.run_spawned = True
+        os.makedirs(self.state())
+        with open(self.state("last-sweep-claude-code"), "w") as f:
+            f.write("0")  # a sweep just ran: these tests count batch workers only
 
     def spawner(self, script, args):
         self.spawned.append(list(args))
@@ -745,7 +748,7 @@ class DetachedWorkerTests(Base):
             time.sleep(0.2)
         return cond()
 
-    def check(self, script, path, sid, interval, expect_turns):
+    def check(self, script, path, sid, interval, expect_turns, args=()):
         os.environ.pop("TRANSCRIPT_CAPTURE_INLINE", None)
         stub = self.stub()
         stub.delay_s = 3
@@ -753,7 +756,7 @@ class DetachedWorkerTests(Base):
         event = json.dumps({"session_id": sid, "transcript_path": path,
                             "cwd": "/home/user/projects/sample-repo"})
         started = time.monotonic()
-        r = self.run_script(script, event)
+        r = self.run_script(script, event, args=args)
         took = time.monotonic() - started
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
         self.assertLess(took, 2.5)  # the hook did not wait for the 3-second retain
@@ -773,6 +776,118 @@ class DetachedWorkerTests(Base):
         path = os.path.join(d, "rollout-2026-01-02T11-00-00-%s.jsonl" % CODEX_SID)
         shutil.copyfile(CODEX_FIXTURE, path)
         self.check("transcript_capture_codex.py", path, CODEX_SID, 1, "1-1")
+
+    def codex_session(self):
+        d = os.path.join(self.tmp, "codex", "sessions", "2026", "01", "02")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "rollout-2026-01-02T11-00-00-%s.jsonl" % CODEX_SID)
+        shutil.copyfile(CODEX_FIXTURE, path)
+        return path
+
+    def test_session_end_detaches_its_worker(self):
+        self.check("transcript_capture.py", self.copy_session(), CLAUDE_SID, 10, "1-4",
+                   args=["--session-end"])
+
+    def test_codex_session_end_detaches_its_worker(self):
+        self.check("transcript_capture_codex.py", self.codex_session(), CODEX_SID, 10, "1-2",
+                   args=["--session-end"])
+
+
+class SessionEndAndSweepTests(Base):
+    """The tail of a session: SessionEnd sends it at once; a session that ended
+    without one is sent by the next sweep, which a Stop starts once an hour."""
+    OTHER_SID = "22222222-2222-4333-8444-555555555555"
+
+    def age(self, path, seconds):
+        t = time.time() - seconds
+        os.utime(path, (t, t))
+
+    def event(self, path, sid=CLAUDE_SID):
+        return json.dumps({"session_id": sid, "transcript_path": path,
+                           "cwd": "/home/user/projects/sample-repo"})
+
+    def test_session_end_sends_the_rest_with_the_newest_turn(self):
+        stub = self.stub()
+        self.write_config(stub.url)  # interval_turns 10: the Stop sends nothing
+        path = self.copy_session()
+        r = self.run_script("transcript_capture.py", self.event(path))
+        self.assertEqual((r.returncode, stub.calls), (0, []))
+        r = self.run_script("transcript_capture.py", self.event(path), args=["--session-end"])
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["1-4"])
+        r = self.run_script("transcript_capture.py", self.event(path), args=["--session-end"])
+        self.assertEqual(len(stub.calls), 1)  # nothing twice
+
+    def test_session_end_with_bad_input_is_silent(self):
+        self.write_config("http://unused")
+        for payload in ("", "not json", json.dumps({"transcript_path": "/nope"})):
+            r = self.run_script("transcript_capture.py", payload, args=["--session-end"])
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+    def test_a_stop_sweeps_idle_sessions_once_an_hour(self):
+        stub = self.stub()
+        self.write_config(stub.url)
+        ended = self.copy_session()
+        self.run_script("transcript_capture.py", self.event(ended))  # seen, then no SessionEnd
+        self.assertTrue(os.path.isfile(self.state("last-sweep-claude-code")))
+        self.age(ended, 3600)
+        active = self.copy_session(name=self.OTHER_SID + ".jsonl")
+        # Within the hour, a Stop in another session does not sweep.
+        self.run_script("transcript_capture.py", self.event(active, self.OTHER_SID))
+        self.assertEqual(stub.calls, [])
+        self.age(self.state("last-sweep-claude-code"), 3601)
+        self.run_script("transcript_capture.py", self.event(active, self.OTHER_SID))
+        self.assertEqual([(c["arguments"]["document_id"], turns_of(c["arguments"]))
+                          for c in stub.calls], [("session:" + CLAUDE_SID, "1-4")])
+        # The next sweep finds nothing left; the active session was never forced.
+        self.age(self.state("last-sweep-claude-code"), 3601)
+        self.run_script("transcript_capture.py", self.event(active, self.OTHER_SID))
+        self.assertEqual(len(stub.calls), 1)
+        cur = read_json(self.state("cursors", self.OTHER_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], len(cur["pending"])), (0, 4))
+
+    def test_sweep_skips_other_harnesses_and_old_cursors(self):
+        stub = self.stub()
+        cfg = self.write_config(stub.url)
+        path = self.copy_session()
+        tc.note_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code")
+        self.age(path, 3600)
+        cursor = self.state("cursors", CLAUDE_SID + ".json")
+        self.assertEqual(tc.sweep_idle(cfg, "codex", tcx.codex_events), 0)
+        self.age(cursor, tc.SWEEP_LOOKBACK_S + 60)
+        self.assertEqual(tc.sweep_idle(cfg, "claude-code", tc.claude_events), 0)
+        self.assertEqual(stub.calls, [])
+        self.age(cursor, 60)
+        self.assertEqual(tc.sweep_idle(cfg, "claude-code", tc.claude_events), 1)
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["1-4"])
+
+    def test_sweep_sends_a_bounded_number_of_batches(self):
+        stub = self.stub()
+        cfg = self.write_config(stub.url, interval_turns=1)
+        path = self.copy_session()
+        tc.note_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code")
+        self.age(path, 3600)
+        saved, tc.SWEEP_MAX_BATCHES = tc.SWEEP_MAX_BATCHES, 3
+        try:
+            self.assertEqual(tc.sweep_idle(cfg, "claude-code", tc.claude_events), 3)
+            self.assertEqual(tc.sweep_idle(cfg, "claude-code", tc.claude_events), 1)
+        finally:
+            tc.SWEEP_MAX_BATCHES = saved
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls],
+                         ["1-1", "2-2", "3-3", "4-4"])
+
+    def test_no_sweep_while_the_door_is_down(self):
+        cfg = self.write_config(dead_url(), timeout_s=3)
+        path = self.copy_session()
+        tc.note_session(cfg, CLAUDE_SID, path, tc.claude_events, "claude-code")
+        self.age(path, 3600)
+        tc.write_owed({"content": "x", "document_id": "session:x"}, "earlier failure",
+                      "claude-code")
+        tc.run_worker(cfg, "claude-code", tc.claude_events, None, None, sweep=True)
+        cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], len(cur["pending"])), (0, 4))  # left for later
+        owed = [n for n in os.listdir(self.state()) if n.startswith("owed-")]
+        self.assertEqual(len(owed), 1)
 
 
 class CatchUpTests(Base):

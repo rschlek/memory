@@ -7,7 +7,7 @@ or register it. The user copies the scripts and wires them into the harness
 
 | File | What it is |
 | --- | --- |
-| `transcript_capture.py` | The Claude Code `Stop` hook and the detached worker it starts, plus `--catch-up`, `--replay-owed` and `--dry-run` modes. Holds the cursor, the scrubber and the MCP client. |
+| `transcript_capture.py` | The Claude Code `Stop` and `SessionEnd` (`--session-end`) hooks and the detached worker they start, plus `--catch-up`, `--replay-owed` and `--dry-run` modes. Holds the cursor, the scrubber and the MCP client. |
 | `transcript_capture_codex.py` | The Codex adapter. It reads Codex session files and reuses everything else from `transcript_capture.py`, which it loads from its own folder, then from `~/.claude/hooks/`. |
 | `test_transcript_capture.py` | Tests: `python -S -I test_transcript_capture.py`. |
 | `testdata/` | Sample Claude Code and Codex session files the tests read. |
@@ -80,14 +80,27 @@ of every chunk near it.
   never sent without its last reply. Once `interval_turns` complete turns are
   waiting (with the default of 10, at the 11th Stop, then the 21st, and so
   on), the hook starts a detached worker and returns at once.
-- **Worker** (`--worker`, started by the hook). A separate process with no
+- **SessionEnd hook** (`--session-end`). When a session ends, the hook
+  starts a worker that sends everything the cursor has not sent, the newest
+  turn included, in batches of `interval_turns`. The hook reads nothing
+  itself, because harnesses give a SessionEnd hook only a second or two.
+- **Sweep.** At most once an hour per harness (`last-sweep-<harness>`), a
+  Stop also has its worker sweep: for every session that harness's hook has
+  seen, whose file has been idle for `catch_up_idle_min` minutes and still
+  has turns unsent, it sends them, the newest turn included. That covers a
+  session that ended without a SessionEnd: a closed window, a crash, a
+  machine put to sleep. Newest sessions first, at most 20 batches per sweep;
+  cursors untouched for 30 days are left to a catch-up by hand.
+- **Worker** (`--worker`, started by the hooks). A separate process with no
   console and no handles shared with the harness, in a process group of its
   own, so the harness neither waits for it nor ends it with the hook. It
-  sends the waiting batches (at most three per run; a longer backlog waits
-  for the next one), and when the door answered, it replays owed retains.
+  sends the waiting batches (at most three per run for a Stop; a longer
+  backlog waits for the next one), then, as long as the door answers, replays
+  owed retains and runs the sweep when one is due.
   `TRANSCRIPT_CAPTURE_INLINE=1` runs it inside the hook's own process
   instead, for tests and debugging.
-- **Catch-up** (`--catch-up`, run by hand). It first replays owed retains.
+- **Catch-up** (`--catch-up`, run by hand; nothing needs to schedule it). It
+  first replays owed retains.
   Then, for every session file idle for `catch_up_idle_min` minutes, it
   sends everything the cursor has not sent, the newest turn included, in
   batches of `interval_turns`. The cursors keep anything from going twice,
@@ -153,7 +166,8 @@ Nothing raises into the harness. The script always exits 0 and prints nothing
   `owed-<date>.jsonl` with the reason. The turns count as handled, so they are
   never sent twice, and that run stops sending. `--replay-owed`, the worker
   after its next run that reaches the door, and the start of every catch-up
-  resend the owed retains. Whatever still fails goes back
+  resend the owed retains. While the door is down, the worker skips the
+  sweep, so idle tails stay in their cursors for a later one. Whatever still fails goes back
   into an owed file. Replayed batches can land out of order in the document;
   each batch's header line gives its place.
 - **What counts as success.** An accepted retain counts, and so does a
@@ -224,7 +238,7 @@ directly. Both scripts read the same file. When the file is missing or
 | `scrub_whole_line` | `false` | Redact the whole line that matches, instead of only the match. |
 | `extra_metadata` | `{}` | More metadata, as strings. It cannot override `device`, `harness`, `session` or `kind`. Metadata applies to the whole document, so keep these values constant. |
 | `timeout_s` | `15` | Deadline for one whole MCP exchange, in seconds. |
-| `catch_up_idle_min` | `30` | Minutes a session file must be untouched before the catch-up sends its newest turn. |
+| `catch_up_idle_min` | `30` | Minutes a session file must be untouched before a sweep or a catch-up sends the rest of it, newest turn included. |
 
 ## State
 
@@ -243,6 +257,7 @@ The state folder is `~/.claude/transcript-capture/`, or
   Deleting a cursor makes the next run read that session again from the
   start, and those turns are sent again.
 - `owed-<date>.jsonl` holds the retains that failed, verbatim.
+- `last-sweep-<harness>` records the last sweep a Stop started.
 - `installed-at` records when capture first ran on this device. (Earlier
   versions kept a catch-up stamp, `last-catch-up-<harness>`; it is no longer
   read and can be deleted.)
@@ -270,6 +285,9 @@ both JSON and event-stream responses and records each `tools/call`. They cover:
   retain finishes
 - lock waits, and owed retains replayed after the next run that reaches the
   door
+- SessionEnd sending the rest of a session, detached, for both scripts
+- the sweep: once an hour, idle sessions only, this harness only, bounded,
+  and not while the door is down
 - the retain arguments
 - scrubbing
 - the MCP exchange
@@ -281,6 +299,12 @@ They never read the real `~/.claude`. Any fake token the tests need is put
 together at run time.
 
 ## Known limits
+
+- What can still be lost: the unsent turns of a session that ended without
+  a SessionEnd, on a device where that harness never runs again (the sweep
+  runs only from a Stop); and owed retains on a device that never reaches
+  the door again. Whether a harness runs SessionEnd hooks when its window is
+  closed or its process killed is not documented; the sweep covers both.
 
 - The Codex line format was checked against session files written by Codex
   CLI 0.100 and 0.107, and against the rollout recorder's source. There is no
