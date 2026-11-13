@@ -28,7 +28,8 @@ CODEX_FIXTURE = os.path.join(HERE, "testdata", "codex-rollout.jsonl")
 CLAUDE_SID = "11111111-2222-4333-8444-555555555555"
 CODEX_SID = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000"
 ENV_KEYS = ("CLAUDE_CONFIG_DIR", "TRANSCRIPT_CAPTURE_HOME", "TRANSCRIPT_CAPTURE_CONFIG",
-            "CODEX_HOME", "TRANSCRIPT_CAPTURE_CORE", "NO_PROXY", "no_proxy")
+            "CODEX_HOME", "TRANSCRIPT_CAPTURE_CORE", "TRANSCRIPT_CAPTURE_INLINE", "NO_PROXY",
+            "no_proxy")
 
 
 def load(name, filename):
@@ -60,6 +61,7 @@ class Stub(object):
     def __init__(self, sse=False):
         self.sse = sse
         self.call_result = None  # JSON text the retain tool returns; default: accepted
+        self.delay_s = 0  # seconds the retain tool takes to answer
         self.requests = []
         self.calls = []
         stub = self
@@ -88,6 +90,8 @@ class Stub(object):
                                                 {"name": "door-sync_retain"},
                                                 {"name": "door-retain"}]})
                 elif method == "tools/call":
+                    if stub.delay_s:
+                        time.sleep(stub.delay_s)
                     stub.calls.append(body["params"])
                     op = "op-%d" % len(stub.calls)
                     text = stub.call_result or json.dumps({"success": True, "operation_id": op})
@@ -156,6 +160,8 @@ class Base(unittest.TestCase):
         os.environ.pop("TRANSCRIPT_CAPTURE_HOME", None)
         os.environ.pop("TRANSCRIPT_CAPTURE_CONFIG", None)
         os.environ["TRANSCRIPT_CAPTURE_CORE"] = os.path.join(HERE, "transcript_capture.py")
+        # The hook runs its worker in-process unless a test is about the detached one.
+        os.environ["TRANSCRIPT_CAPTURE_INLINE"] = "1"
         tc._secret_cache.clear()
         tcx.core._secret_cache.clear()
         self.key_file = os.path.join(self.tmp, "device.key")
@@ -586,6 +592,189 @@ class HookEndToEndTests(Base):
         self.assertIn("project:sample-repo", args["tags"])
 
 
+def claude_line(kind, text, n, sid=CLAUDE_SID):
+    """One Claude Code session-file line, for sessions built turn by turn."""
+    obj = {"sessionId": sid, "cwd": "/home/user/projects/sample-repo", "isSidechain": False,
+           "type": kind, "uuid": "u%04d" % n,
+           "timestamp": "2026-01-02T%02d:%02d:00.000Z" % (10 + n // 60, n % 60)}
+    if kind == "user":
+        obj.update({"message": {"role": "user", "content": text}, "origin": {"kind": "human"}})
+    else:
+        obj["message"] = {"role": "assistant", "model": "model-x",
+                          "content": [{"type": "text", "text": text}]}
+    return json.dumps(obj) + "\n"
+
+
+class TurnCounterTests(Base):
+    """The hook counts turns as a session grows and starts one worker per
+    interval_turns complete turns; the cursor keeps any turn from going twice."""
+
+    def setUp(self):
+        super(TurnCounterTests, self).setUp()
+        os.environ.pop("TRANSCRIPT_CAPTURE_INLINE", None)
+        self.spawned = []
+        self.run_spawned = True
+
+    def spawner(self, script, args):
+        self.spawned.append(list(args))
+        if self.run_spawned:
+            tc.main(list(args))  # the worker, in this process
+        return True
+
+    def new_session(self):
+        d = os.path.join(self.claude, "projects", "-home-user-proj")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, CLAUDE_SID + ".jsonl")
+
+    def turn(self, path, t):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(claude_line("user", "question %d" % t, 2 * t))
+            f.write(claude_line("assistant", "answer %d" % t, 2 * t + 1))
+
+    def stop(self, path):
+        event = json.dumps({"session_id": CLAUDE_SID, "transcript_path": path,
+                            "cwd": "/home/user/projects/sample-repo"})
+        return tc.hook(event, "claude-code", tc.claude_events, tc.claude_session_id,
+                       script="unused", spawner=self.spawner)
+
+    def grow(self, path, turns):
+        """Add turns one at a time with a Stop after each; return the turns whose
+        Stop started a worker."""
+        at = []
+        for t in turns:
+            self.turn(path, t)
+            before = len(self.spawned)
+            self.assertEqual(self.stop(path), 0)
+            if len(self.spawned) > before:
+                at.append(t)
+        return at
+
+    def test_ships_every_interval_turns_without_resending(self):
+        stub = self.stub()
+        self.write_config(stub.url)  # interval_turns 10
+        path = self.new_session()
+        # A turn is complete once the next one starts, so turns 1-10 go at the 11th Stop.
+        self.assertEqual(self.grow(path, range(1, 26)), [11, 21])
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["1-10", "11-20"])
+        bodies = "".join(body_of(c["arguments"]) + "\n" for c in stub.calls)
+        for t in range(1, 21):
+            self.assertEqual(bodies.count("user: question %d\n" % t), 1, t)
+            self.assertEqual(bodies.count("assistant: answer %d\n" % t), 1, t)
+        self.assertNotIn("question 21", bodies)
+        cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], len(cur["pending"])), (20, 5))
+        self.assertEqual(cur["offset"], os.path.getsize(path))
+        self.assertEqual(self.spawned[0], ["--worker", "--session", CLAUDE_SID, "--transcript",
+                                           path, "--cwd", "/home/user/projects/sample-repo"])
+        # A Stop with nothing new starts nothing and sends nothing.
+        self.stop(path)
+        self.assertEqual((len(self.spawned), len(stub.calls)), (2, 2))
+
+    def test_interval_is_the_config_setting(self):
+        stub = self.stub()
+        self.write_config(stub.url, interval_turns=3)
+        path = self.new_session()
+        self.assertEqual(self.grow(path, range(1, 8)), [4, 7])
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["1-3", "4-6"])
+
+    def test_hook_reads_but_never_contacts_the_gateway(self):
+        self.write_config(dead_url(), timeout_s=3)
+        self.run_spawned = False
+        path = self.new_session()
+        started = time.monotonic()
+        self.assertEqual(self.grow(path, range(1, 12)), [11])
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual([n for n in os.listdir(self.state()) if n.startswith("owed-")], [])
+        cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], len(cur["pending"])), (0, 11))
+
+    def test_a_held_session_is_read_by_the_next_stop(self):
+        stub = self.stub()
+        self.write_config(stub.url, interval_turns=2)
+        path = self.new_session()
+        with tc.SessionLock(CLAUDE_SID):
+            self.assertEqual(self.grow(path, range(1, 4)), [])  # a worker holds it
+        self.assertFalse(os.path.exists(self.state("cursors", CLAUDE_SID + ".json")))
+        self.assertEqual(self.grow(path, [4]), [4])  # the lines from turns 1-3 too
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["1-2"])
+        cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], len(cur["pending"])), (2, 2))
+
+
+class WorkerTests(Base):
+    def test_failed_batch_is_owed_and_replayed_after_the_next_success(self):
+        cfg = self.write_config(dead_url(), interval_turns=1, timeout_s=3)
+        path = self.copy_session()
+        tc.run_worker(cfg, "claude-code", tc.claude_events, CLAUDE_SID, path)
+        owed = [n for n in os.listdir(self.state()) if n.startswith("owed-")]
+        self.assertEqual(len(owed), 1)
+        cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], cur["owed_batches"]), (1, 1))
+        stub = self.stub()
+        cfg = self.write_config(stub.url, interval_turns=1)
+        tc.run_worker(cfg, "claude-code", tc.claude_events, CLAUDE_SID, path)
+        # The due batches first, then the owed one; the newest turn still waits.
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["2-2", "3-3", "1-1"])
+        self.assertEqual([n for n in os.listdir(self.state()) if n.startswith("owed-")], [])
+
+    def test_worker_waits_for_a_session_another_process_holds(self):
+        stub = self.stub()
+        cfg = self.write_config(stub.url, interval_turns=2)
+        path = self.copy_session()
+        lock = tc.SessionLock(CLAUDE_SID)
+        lock.__enter__()
+        threading.Timer(1.0, lock.__exit__).start()
+        tc.run_worker(cfg, "claude-code", tc.claude_events, CLAUDE_SID, path)
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls], ["1-2"])
+
+    def test_worker_without_config_or_file_is_silent(self):
+        args = ["--worker", "--session", CLAUDE_SID, "--transcript", "/nope"]
+        r = self.run_script("transcript_capture.py", args=args)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.write_config("http://unused")
+        r = self.run_script("transcript_capture.py", args=args)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+
+
+class DetachedWorkerTests(Base):
+    """The real thing: the hook process exits while its worker is still sending."""
+
+    def wait_for(self, cond, timeout=30):
+        deadline = time.monotonic() + timeout
+        while not cond() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        return cond()
+
+    def check(self, script, path, sid, interval, expect_turns):
+        os.environ.pop("TRANSCRIPT_CAPTURE_INLINE", None)
+        stub = self.stub()
+        stub.delay_s = 3
+        self.write_config(stub.url, interval_turns=interval)
+        event = json.dumps({"session_id": sid, "transcript_path": path,
+                            "cwd": "/home/user/projects/sample-repo"})
+        started = time.monotonic()
+        r = self.run_script(script, event)
+        took = time.monotonic() - started
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        self.assertLess(took, 2.5)  # the hook did not wait for the 3-second retain
+        self.assertTrue(self.wait_for(lambda: len(stub.calls) == 1))
+        self.assertEqual(turns_of(stub.calls[0]["arguments"]), expect_turns)
+        cursor = self.state("cursors", sid + ".json")
+        self.assertTrue(self.wait_for(
+            lambda: read_json(cursor).get("last_operation_id") == "op-1"
+            and not os.listdir(self.state("locks"))))
+
+    def test_claude_code_hook_detaches_its_worker(self):
+        self.check("transcript_capture.py", self.copy_session(), CLAUDE_SID, 2, "1-2")
+
+    def test_codex_hook_detaches_its_worker(self):
+        d = os.path.join(self.tmp, "codex", "sessions", "2026", "01", "02")
+        os.makedirs(d)
+        path = os.path.join(d, "rollout-2026-01-02T11-00-00-%s.jsonl" % CODEX_SID)
+        shutil.copyfile(CODEX_FIXTURE, path)
+        self.check("transcript_capture_codex.py", path, CODEX_SID, 1, "1-1")
+
+
 class CatchUpTests(Base):
     def age(self, path, seconds):
         t = time.time() - seconds
@@ -603,27 +792,46 @@ class CatchUpTests(Base):
         r = self.run_script("transcript_capture.py", args=["--catch-up"])
         self.assertEqual(r.returncode, 0)
         self.assertEqual(stub.calls, [])
-        os.remove(self.state("last-catch-up-claude-code"))
+        # --backfill sends it, although a catch-up already ran after the file last
+        # changed (a stamp used to skip it).
         r = self.run_script("transcript_capture.py", args=["--catch-up", "--backfill"])
         self.assertEqual((r.returncode, r.stdout), (0, ""))
         self.assertEqual(len(stub.calls), 1)  # the recent file is not idle yet
         args = stub.calls[0]["arguments"]
         self.assertEqual(args["document_id"], "session:" + CLAUDE_SID)
         self.assertEqual(turns_of(args), "1-4")
-        self.assertTrue(os.path.isfile(self.state("last-catch-up-claude-code")))
-        # A later night: the recent file has gone idle and is newer than the stamp.
-        with open(self.state("last-catch-up-claude-code"), "w") as f:
+        self.assertFalse(os.path.exists(self.state("last-catch-up-claude-code")))
+        # Later: the recent file has gone idle, and it changed after the first run.
+        with open(self.state("installed-at"), "w") as f:
             f.write(repr(time.time() - 7200))
         self.age(recent, 3600)
-        r = self.run_script("transcript_capture.py", args=["--catch-up", "--backfill"])
+        r = self.run_script("transcript_capture.py", args=["--catch-up"])
         self.assertEqual(len(stub.calls), 2)
         self.assertEqual(stub.calls[1]["arguments"]["document_id"],
                          "session:22222222-2222-4333-8444-555555555555")
         # And again: every cursor is current, nothing is resent.
-        with open(self.state("last-catch-up-claude-code"), "w") as f:
-            f.write("0")
         r = self.run_script("transcript_capture.py", args=["--catch-up", "--backfill"])
         self.assertEqual(len(stub.calls), 2)
+
+    def test_catch_up_sends_turns_left_over_from_a_failure(self):
+        self.write_config(dead_url(), interval_turns=1, timeout_s=3)
+        path = self.copy_session()
+        self.age(path, 3600)
+        os.makedirs(self.state())
+        with open(self.state("installed-at"), "w") as f:
+            f.write(repr(time.time() - 7200))
+        self.run_script("transcript_capture.py", args=["--catch-up"])
+        cur = read_json(self.state("cursors", CLAUDE_SID + ".json"))
+        self.assertEqual((cur["turns_sent"], len(cur["pending"])), (1, 3))  # stopped at the failure
+        self.age(path, 3600)
+        stub = self.stub()
+        self.write_config(stub.url, interval_turns=1)
+        r = self.run_script("transcript_capture.py", args=["--catch-up"])
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual([turns_of(c["arguments"]) for c in stub.calls],
+                         ["1-1", "2-2", "3-3", "4-4"])  # owed first, then the rest
+        r = self.run_script("transcript_capture.py", args=["--catch-up"])
+        self.assertEqual(len(stub.calls), 4)
 
     def test_catch_up_flushes_a_session_the_hook_saw(self):
         stub = self.stub()

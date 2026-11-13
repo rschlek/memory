@@ -2,16 +2,19 @@
 """Save the conversation text of an agent session to a memory bank, as it happens.
 
 A Claude Code `Stop` hook. Each time the agent stops, it reads the session file
-from where it last left off, keeps only conversation text (the user's typed
+from where it last left off and keeps only conversation text (the user's typed
 messages and the assistant's prose; never tool calls, tool output, thinking, or
-subagent lines), and every `interval_turns` complete turns sends one `retain` to
-the memory service through an MCP door on a gateway. All of a session's text
-lands in one document, `session:<session_id>`, by appending.
+subagent lines). Once `interval_turns` complete turns are waiting, it starts a
+detached worker that sends them as one `retain` to the memory service through
+an MCP door on a gateway, and returns without waiting for it. All of a
+session's text lands in one document, `session:<session_id>`, by appending.
 
 Modes:
-  (no argument)    Stop hook: read the event JSON on stdin.
-  --catch-up       For a scheduler: send what is unsent for every session file
-                   changed since the last catch-up and idle for
+  (no argument)    Stop hook: read the event JSON on stdin. Never touches the
+                   network itself.
+  --worker         The detached process the hook starts (--session, --transcript,
+                   --cwd, --force). Sends what is due, then replays owed retains.
+  --catch-up       By hand: send what is unsent for every session file idle for
                    `catch_up_idle_min` minutes, ignoring the interval. Replays
                    owed retains first.
   --replay-owed    Resend the retains that could not be sent earlier.
@@ -29,7 +32,8 @@ Files (under ~/.claude, or $CLAUDE_CONFIG_DIR when set):
 
 Never raises into the harness: every failure is logged and the script exits 0
 with no output. Standard library only; Python 3.9 or newer; runs as
-`python -S -I transcript_capture.py`.
+`python -S -I transcript_capture.py`. TRANSCRIPT_CAPTURE_INLINE=1 makes the hook
+run the worker in its own process instead of detaching it (tests, debugging).
 """
 from __future__ import annotations
 
@@ -40,7 +44,7 @@ import re
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HARNESS = "claude-code"
 PROTOCOL_VERSION = "2025-06-18"
 CONTEXT = "verbatim transcript of an agent session, conversation text only"
@@ -48,6 +52,7 @@ REDACTED = "[redacted]"
 REDACTED_LINE = "[redacted line]"
 MAX_BATCHES_PER_STOP = 3
 LOCK_STALE_S = 120
+LOCK_WAIT_S = 60  # how long a worker waits for a session another process is sending
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_SECRET_FILE_BYTES = 256 * 1024
 MIN_SECRET_LEN = 16
@@ -665,11 +670,15 @@ def write_owed(arguments, reason, harness):
         log("owed write failed: %s" % type(e).__name__)
 
 
+def owed_files():
+    return sorted(glob.glob(os.path.join(state_dir(), "owed-*.jsonl")))
+
+
 def replay_owed(cfg, sender=None):
     """Resend owed retains; whatever still fails goes back to an owed file."""
     sender = sender or send
     sent = failed = 0
-    for path in sorted(glob.glob(os.path.join(state_dir(), "owed-*.jsonl"))):
+    for path in owed_files():
         work = "%s.replay-%d" % (path, os.getpid())
         try:
             os.replace(path, work)
@@ -732,13 +741,14 @@ def save_cursor(cur):
 
 
 def advance(cur, path, events_fn):
-    """Read complete lines from the cursor's offset and add their turns to pending."""
-    offset = int(cur.get("offset") or 0)
+    """Read complete lines from the cursor's offset and add their turns to pending.
+    Returns True when the offset moved."""
+    start = offset = int(cur.get("offset") or 0)
     size = os.path.getsize(path)
     if size < offset:
         log("session file shorter than its cursor; skipping ahead: %s" % cur["session_id"])
         cur["offset"] = size
-        return
+        return True
     pending = cur.setdefault("pending", [])
     with open(path, "rb") as f:
         f.seek(offset)
@@ -756,6 +766,7 @@ def advance(cur, path, events_fn):
                 else:
                     pending.append({"u": "", "a": [value], "ts": ts})
     cur["offset"] = offset
+    return offset != start
 
 
 def ready_turns(cur, force):
@@ -765,17 +776,21 @@ def ready_turns(cur, force):
     return n if force else max(0, n - 1)
 
 
-def flush(cfg, cur, force, harness, sender=None):
-    """Send complete turns in batches of interval_turns (any remainder when forced)."""
+def flush(cfg, cur, force, harness, sender=None, limit=None, lock=None):
+    """Send complete turns in batches of interval_turns (any remainder when
+    forced). At most `limit` batches; without force, at most MAX_BATCHES_PER_STOP.
+    Returns (batches, failed); one failed batch ends the run."""
     sender = sender or send
     interval = cfg["interval_turns"]
+    if limit is None and not force:
+        limit = MAX_BATCHES_PER_STOP
     batches = 0
     while True:
         ready = ready_turns(cur, force)
         if ready == 0 or (not force and ready < interval):
-            return batches
-        if not force and batches >= MAX_BATCHES_PER_STOP:
-            return batches
+            return batches, False
+        if limit is not None and batches >= limit:
+            return batches, False
         n = min(interval, ready)
         turns = cur["pending"][:n]
         first = int(cur.get("turns_sent") or 0) + 1
@@ -796,24 +811,28 @@ def flush(cfg, cur, force, harness, sender=None):
         cur["turns_sent"] = first + n - 1
         del cur["pending"][:n]
         save_cursor(cur)
+        if lock is not None:
+            lock.refresh()
         batches += 1
         if failed:
-            return batches  # do not spend another timeout on a door that is down
+            return batches, True  # do not spend another timeout on a door that is down
 
 
 class SessionLock(object):
-    def __init__(self, session_id):
+    """One lock file per session. A lock untouched for LOCK_STALE_S is taken over,
+    so a holder refreshes it after every batch it sends."""
+
+    def __init__(self, session_id, wait_s=0):
         self.path = os.path.join(state_dir(), "locks", safe_id(session_id) + ".lock")
+        self.wait_s = wait_s
         self.held = False
 
-    def __enter__(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+    def _try(self):
         for _ in range(2):
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.write(fd, str(os.getpid()).encode("ascii"))
                 os.close(fd)
-                self.held = True
                 return True
             except FileExistsError:
                 try:
@@ -827,6 +846,23 @@ class SessionLock(object):
                 return False
         return False
 
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        deadline = time.monotonic() + self.wait_s
+        while not self._try():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+        self.held = True
+        return True
+
+    def refresh(self):
+        if self.held:
+            try:
+                os.utime(self.path, None)
+            except OSError:
+                pass
+
     def __exit__(self, *exc):
         if self.held:
             try:
@@ -836,30 +872,104 @@ class SessionLock(object):
         return False
 
 
+def read_session(session_id, path, events_fn, harness, cwd=None):
+    """Load the cursor and advance it over the file's new lines. The caller holds
+    the session's lock. The cursor is written only when something changed."""
+    cur = load_cursor(session_id, path, harness)
+    changed = advance(cur, path, events_fn)
+    if cur.get("transcript_path") != path:
+        cur["transcript_path"] = path
+        changed = True
+    if cwd and cur.get("cwd") != cwd:
+        cur["cwd"] = cwd
+        changed = True
+    if changed or not os.path.isfile(cursor_path(session_id)):
+        save_cursor(cur)
+    return cur
+
+
+def note_session(cfg, session_id, path, events_fn, harness, cwd=None):
+    """The Stop hook's share: read the new lines into the cursor, send nothing.
+    Returns the number of complete turns waiting, or -1 when another process is
+    working on the session (the next Stop reads the lines instead)."""
+    with SessionLock(session_id) as held:
+        if not held:
+            return -1
+        return ready_turns(read_session(session_id, path, events_fn, harness, cwd), False)
+
+
 def process_session(cfg, session_id, path, events_fn, harness, force=False, cwd=None,
-                    sender=None, dry_run=False):
-    """Advance one session's cursor and send what is due. Returns batches sent."""
-    if dry_run:  # read only: no lock, no cursor write
+                    sender=None, dry_run=False, limit=None, wait_s=0):
+    """Advance one session's cursor and send what is due. Returns (batches, failed)."""
+    if dry_run:  # read only: no lock, no cursor write; a row only when turns are ready
         cur = load_cursor(session_id, path, harness)
         advance(cur, path, events_fn)
         ready = ready_turns(cur, force)
-        turns = cur["pending"][:ready]
-        text = scrub(render(turns), cfg) if turns else ""
+        if not ready:
+            return 0, False
+        text = scrub(render(cur["pending"][:ready]), cfg)
         proj = project_name(cwd or cur.get("cwd"), cfg.get("projects_root"))
         print(json.dumps({"session": session_id, "harness": harness, "turns_ready": ready,
                           "chars": len(text), "redactions": text.count(REDACTED),
                           "project_tag": ("project:" + proj) if proj else None}))
-        return 0
-    with SessionLock(session_id) as held:
+        return 0, False
+    lock = SessionLock(session_id, wait_s)
+    with lock as held:
         if not held:
-            return 0
-        cur = load_cursor(session_id, path, harness)
-        cur["transcript_path"] = path
-        advance(cur, path, events_fn)
-        if cwd:
-            cur["cwd"] = cwd
-        save_cursor(cur)
-        return flush(cfg, cur, force, harness, sender)
+            return 0, False
+        cur = read_session(session_id, path, events_fn, harness, cwd)
+        return flush(cfg, cur, force, harness, sender, limit=limit, lock=lock)
+
+
+# ---------------------------------------------------------------- worker
+
+def spawn_worker(script, args):
+    """Start `<python> -S -I <script> <args>` detached from the hook: no console,
+    no inherited handles, a process group of its own, and on Windows outside the
+    hook's job object when the job allows it. Returns True when it started."""
+    import subprocess
+    cmd = [sys.executable, "-S", "-I", script] + list(args)
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+          "stderr": subprocess.DEVNULL, "close_fds": True,
+          "cwd": os.path.expanduser("~")}
+    try:
+        if os.name == "nt":
+            flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            try:
+                subprocess.Popen(cmd, creationflags=flags | 0x01000000, **kw)  # BREAKAWAY_FROM_JOB
+            except OSError:
+                subprocess.Popen(cmd, creationflags=flags, **kw)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **kw)
+        return True
+    except Exception as e:
+        log("worker did not start: %s" % type(e).__name__)
+        return False
+
+
+def run_worker(cfg, harness, events_fn, session_id, path, cwd=None, force=False,
+               sender=None):
+    """Send what is due for one session; then, when the door answered, replay the
+    owed retains. Waits up to LOCK_WAIT_S for a session another process holds."""
+    failed = False
+    if session_id and path and os.path.isfile(path):
+        _, failed = process_session(cfg, session_id, path, events_fn, harness, force=force,
+                                    cwd=cwd, sender=sender, wait_s=LOCK_WAIT_S)
+    if not failed and owed_files():
+        replay_owed(cfg, sender)
+
+
+def start_worker(cfg, harness, events_fn, session_id, path, cwd, force, script,
+                 spawner=None):
+    if os.environ.get("TRANSCRIPT_CAPTURE_INLINE") == "1":
+        run_worker(cfg, harness, events_fn, session_id, path, cwd, force)
+        return
+    args = ["--worker", "--session", session_id, "--transcript", path]
+    if cwd:
+        args += ["--cwd", cwd]
+    if force:
+        args.append("--force")
+    (spawner or spawn_worker)(script or os.path.abspath(__file__), args)
 
 
 # ---------------------------------------------------------------- modes
@@ -894,28 +1004,21 @@ def installed_at(record=True):
 
 def catch_up(cfg, harness, files, session_id_fn, events_fn, dry_run=False, sender=None,
              backfill=False):
-    """Send what is unsent for every session file changed since the last run and
-    idle long enough. The stamp records now - idle, so a file skipped as too
-    recent is picked up by the next run. A session with no cursor (the hook
+    """By hand: send what is unsent, the newest turn included, for every session
+    file idle for catch_up_idle_min minutes. The cursors keep anything from going
+    twice, so it keeps no stamp and looks at every file; a cursor with turns left
+    over from an earlier failure is sent too. A session with no cursor (the hook
     never saw it) is sent only if its file changed after the first run, or with
-    backfill."""
+    backfill. Stops at the first failed batch. Returns the batches sent."""
     if not dry_run:
         replay_owed(cfg, sender)
     first_run = installed_at(record=not dry_run)
-    stamp = os.path.join(state_dir(), "last-catch-up-%s" % harness)
-    since = 0.0
-    try:
-        with open(stamp, encoding="utf-8") as f:
-            since = float(f.read().strip() or 0)
-    except (OSError, ValueError):
-        pass
-    idle_s = float(cfg.get("catch_up_idle_min") or 30) * 60
-    horizon = time.time() - idle_s
+    horizon = time.time() - float(cfg.get("catch_up_idle_min") or 30) * 60
     done = 0
     for path in sorted(files):
         try:
             mtime = os.path.getmtime(path)
-            if mtime <= since or mtime > horizon:
+            if mtime > horizon:
                 continue
             sid = session_id_fn(path)
             if not sid:
@@ -923,41 +1026,59 @@ def catch_up(cfg, harness, files, session_id_fn, events_fn, dry_run=False, sende
             if (not backfill and mtime < first_run
                     and not os.path.isfile(cursor_path(sid))):
                 continue
-            if sid:
-                done += process_session(cfg, sid, path, events_fn, harness, force=True,
-                                        sender=sender, dry_run=dry_run)
+            batches, failed = process_session(cfg, sid, path, events_fn, harness, force=True,
+                                              sender=sender, dry_run=dry_run)
+            done += batches
+            if failed:
+                break  # the door is down; the rest waits for the next run
         except Exception as e:
             log("catch-up %s: %s" % (os.path.basename(path), type(e).__name__))
-    if not dry_run:
-        os.makedirs(state_dir(), exist_ok=True)
-        with open(stamp, "w", encoding="utf-8") as f:
-            f.write(repr(horizon))
     return done
 
 
-def hook(stdin_text, harness, events_fn, session_id_fn=None):
-    """Stop hook body: never raises, never prints."""
+def hook(stdin_text, harness, events_fn, session_id_fn=None, script=None, spawner=None):
+    """Stop hook body: read the new lines; when a batch is due, start a detached
+    worker to send it. Never raises, never prints, never waits on the network."""
     try:
         cfg = load_config()
         if not cfg:
             return 0
         installed_at()
         data = json.loads(stdin_text or "{}")
+        if not isinstance(data, dict):
+            return 0
         path = data.get("transcript_path") or ""
         if not path or not os.path.isfile(path):
             return 0
         sid = (session_id_fn(path) if session_id_fn else None) or data.get("session_id")
         if not sid:
             return 0
-        process_session(cfg, str(sid), path, events_fn, harness, cwd=data.get("cwd"))
+        sid, cwd = str(sid), data.get("cwd") or None
+        if note_session(cfg, sid, path, events_fn, harness, cwd) >= cfg["interval_turns"]:
+            start_worker(cfg, harness, events_fn, sid, path, cwd, False, script, spawner)
     except Exception as e:
         log("hook error %s: %s" % (type(e).__name__, str(e)[:200]))
     return 0
 
 
-def main(argv, harness=HARNESS, events_fn=claude_events, files_fn=claude_session_files,
-         session_id_fn=claude_session_id, hook_session_id_fn=claude_session_id):
+def _opt(argv, name):
     try:
+        i = argv.index(name)
+    except ValueError:
+        return None
+    return argv[i + 1] if i + 1 < len(argv) else None
+
+
+def main(argv, harness=HARNESS, events_fn=claude_events, files_fn=claude_session_files,
+         session_id_fn=claude_session_id, hook_session_id_fn=claude_session_id, script=None):
+    try:
+        if "--worker" in argv:
+            cfg = load_config()
+            if cfg:
+                run_worker(cfg, harness, events_fn, _opt(argv, "--session"),
+                           _opt(argv, "--transcript"), _opt(argv, "--cwd"),
+                           force="--force" in argv)
+            return 0
         if "--catch-up" in argv or "--replay-owed" in argv:
             dry = "--dry-run" in argv
             cfg = load_config(require_enabled=not dry)
@@ -969,7 +1090,8 @@ def main(argv, harness=HARNESS, events_fn=claude_events, files_fn=claude_session
             else:
                 replay_owed(cfg)
             return 0
-        return hook(sys.stdin.read(), harness, events_fn, hook_session_id_fn)
+        return hook(sys.stdin.read(), harness, events_fn, hook_session_id_fn,
+                    script=script or os.path.abspath(__file__))
     except Exception as e:
         log("error %s: %s" % (type(e).__name__, str(e)[:200]))
         return 0

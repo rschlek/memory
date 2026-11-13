@@ -2,10 +2,12 @@
 """Codex adapter for transcript_capture.py: the same cursor, scrub, and sender,
 reading Codex session files instead of Claude Code ones.
 
-Wire it as a Codex `Stop` hook (silent exit 0 is a no-op for Codex), and run
-`--catch-up` from a scheduler like the Claude Code script. It shares the config
-file (~/.claude/transcript-capture.json, or $TRANSCRIPT_CAPTURE_CONFIG) and the
-state folder with the Claude Code script; metadata says "harness": "codex".
+Wire it as a Codex `Stop` hook (silent exit 0 is a no-op for Codex). Like the
+Claude Code script, the hook only reads and starts a detached worker (this same
+script, `--worker`) when a batch is due, so the turn never waits on the network;
+`--catch-up` and `--replay-owed` are run by hand. It shares the config file
+(~/.claude/transcript-capture.json, or $TRANSCRIPT_CAPTURE_CONFIG) and the state
+folder with the Claude Code script; metadata says "harness": "codex".
 
 Codex session files: $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl
 ($CODEX_HOME defaults to ~/.codex). Each line is {"timestamp", "type",
@@ -118,7 +120,7 @@ def main(argv):
         return 0
     return core.main(argv, harness=HARNESS, events_fn=codex_events,
                      files_fn=codex_session_files, session_id_fn=codex_session_id,
-                     hook_session_id_fn=codex_session_id)
+                     hook_session_id_fn=codex_session_id, script=os.path.abspath(__file__))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ or register it. The user copies the scripts and wires them into the harness
 
 | File | What it is |
 | --- | --- |
-| `transcript_capture.py` | The Claude Code `Stop` hook, plus `--catch-up`, `--replay-owed` and `--dry-run` modes. Holds the cursor, the scrubber and the MCP client. |
+| `transcript_capture.py` | The Claude Code `Stop` hook and the detached worker it starts, plus `--catch-up`, `--replay-owed` and `--dry-run` modes. Holds the cursor, the scrubber and the MCP client. |
 | `transcript_capture_codex.py` | The Codex adapter. It reads Codex session files and reuses everything else from `transcript_capture.py`, which it loads from its own folder, then from `~/.claude/hooks/`. |
 | `test_transcript_capture.py` | Tests: `python -S -I test_transcript_capture.py`. |
 | `testdata/` | Sample Claude Code and Codex session files the tests read. |
@@ -73,21 +73,29 @@ of every chunk near it.
 ## When it sends
 
 - **Stop hook.** Every time the agent stops, the hook reads the session file
-  from the cursor's byte offset (whole lines only), adds the new turns to the
-  cursor's pending list, and sends once there are `interval_turns` complete
-  turns. The newest turn always waits for the next user message, because the
-  session file can lag the Stop event. That way a turn is never sent without
-  its last reply. One Stop sends at most three batches; a longer backlog
-  waits for the next Stop or the catch-up.
-- **Catch-up** (`--catch-up`, from a scheduler). It first replays owed
-  retains. Then, for every session file changed since the last catch-up and
-  idle for `catch_up_idle_min` minutes, it sends everything the cursor has
-  not sent, the newest turn included, in batches of `interval_turns`. The
-  stamp file records "now minus the idle time", so a file skipped because it
-  was still active is picked up next time. A session the hook never saw is
-  sent only if its file changed after capture first ran on this device
-  (`installed-at`). `--backfill` lifts that limit, to send older history on
-  purpose.
+  from the cursor's byte offset (whole lines only) and adds the new turns to
+  the cursor's pending list. That is all it does on most turns: it never
+  touches the network. The newest turn always waits for the next user
+  message, because the session file can lag the Stop event, so a turn is
+  never sent without its last reply. Once `interval_turns` complete turns are
+  waiting (with the default of 10, at the 11th Stop, then the 21st, and so
+  on), the hook starts a detached worker and returns at once.
+- **Worker** (`--worker`, started by the hook). A separate process with no
+  console and no handles shared with the harness, in a process group of its
+  own, so the harness neither waits for it nor ends it with the hook. It
+  sends the waiting batches (at most three per run; a longer backlog waits
+  for the next one), and when the door answered, it replays owed retains.
+  `TRANSCRIPT_CAPTURE_INLINE=1` runs it inside the hook's own process
+  instead, for tests and debugging.
+- **Catch-up** (`--catch-up`, run by hand). It first replays owed retains.
+  Then, for every session file idle for `catch_up_idle_min` minutes, it
+  sends everything the cursor has not sent, the newest turn included, in
+  batches of `interval_turns`. The cursors keep anything from going twice,
+  so it keeps no stamp and looks at every file, including one whose cursor
+  still holds turns left over from a failure. It stops at the first failed
+  batch. A session the hook never saw is sent only if its file changed after
+  capture first ran on this device (`installed-at`). `--backfill` lifts that
+  limit, to send older history on purpose.
 - **Dry run** (`--catch-up --dry-run`, optionally with `--backfill`). It
   prints one JSON line per session that would be sent: turns ready, characters
   after scrubbing, the number of redactions and the project tag. It never
@@ -143,8 +151,9 @@ Nothing raises into the harness. The script always exits 0 and prints nothing
   result that reports an error status or `success: false`, a timeout, an
   unreadable key). The full arguments of the retain go to
   `owed-<date>.jsonl` with the reason. The turns count as handled, so they are
-  never sent twice, and that run stops sending. `--replay-owed`, and the start
-  of every catch-up, resend the owed retains. Whatever still fails goes back
+  never sent twice, and that run stops sending. `--replay-owed`, the worker
+  after its next run that reaches the door, and the start of every catch-up
+  resend the owed retains. Whatever still fails goes back
   into an owed file. Replayed batches can land out of order in the document;
   each batch's header line gives its place.
 - **What counts as success.** An accepted retain counts, and so does a
@@ -159,9 +168,11 @@ Nothing raises into the harness. The script always exits 0 and prints nothing
   again. That costs embedding time only; no text is lost or duplicated.
 - **Any other error** adds one line to `capture.log`, which never holds text
   or keys and rolls over at 512 KB.
-- **Overlap.** A per-session lock file keeps a Stop and a catch-up from
-  working on one session at the same time. A lock older than two minutes is
-  treated as stale.
+- **Overlap.** A per-session lock file keeps a Stop, a worker and a
+  catch-up from working on one session at the same time. A Stop that finds
+  the session locked leaves the new lines for the next Stop; a worker waits
+  up to a minute for it. A lock untouched for two minutes is treated as
+  stale, so a worker refreshes its lock after every batch.
 
 ## Scrubbing
 
@@ -204,7 +215,7 @@ directly. Both scripts read the same file. When the file is missing or
 | `mount_header` | `x-mcp-servers` | The header the gateway uses to pick a server. |
 | `key_file` | (required) | A file that holds only the gateway key, on one line. It is read at call time. |
 | `tool_name` | `""` | The retain tool's name as the gateway lists it. When empty, it is found with `tools/list`. |
-| `interval_turns` | `10` | Complete turns per retain. At most this many turns are lost if a session dies without a catch-up. |
+| `interval_turns` | `10` | Complete turns per retain: the hook starts a worker each time this many are waiting. It is the one setting for how often a session is sent. |
 | `projects_root` | `""` | The folder that holds the repositories. A session that runs below it gets `project:<repository folder>`. |
 | `tags` | `[]` | Tags put on every retain, for example a group tag. |
 | `device` | `""` | `metadata.device`. Left out when empty. |
@@ -232,8 +243,9 @@ The state folder is `~/.claude/transcript-capture/`, or
   Deleting a cursor makes the next run read that session again from the
   start, and those turns are sent again.
 - `owed-<date>.jsonl` holds the retains that failed, verbatim.
-- `last-catch-up-<harness>` is the catch-up stamp. `installed-at` records when
-  capture first ran on this device.
+- `installed-at` records when capture first ran on this device. (Earlier
+  versions kept a catch-up stamp, `last-catch-up-<harness>`; it is no longer
+  read and can be deleted.)
 - `capture.log` is the error log.
 - `locks/` holds the per-session locks.
 
@@ -252,6 +264,12 @@ both JSON and event-stream responses and records each `tools/call`. They cover:
 - parsing both session formats
 - cursor advance and half-written lines
 - the interval and the newest turn held back
+- the turn counter as a session grows turn by turn: one worker per
+  `interval_turns` turns, nothing sent twice
+- the detached worker, for both scripts: the hook returns before a slow
+  retain finishes
+- lock waits, and owed retains replayed after the next run that reaches the
+  door
 - the retain arguments
 - scrubbing
 - the MCP exchange

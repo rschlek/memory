@@ -58,10 +58,11 @@ Start a new session afterwards.
 
 ## Transcript capture
 
-`hooks/` holds an optional hook. When a session stops, the hook saves the
+`hooks/` holds an optional hook. As a session goes on, the hook saves the
 conversation text from that session (the user's messages and the assistant's
 prose, never tool calls or tool output) to a memory bank kept for transcripts.
-It sends ten turns at a time by default, all into one document per session,
+It sends `interval_turns` turns at a time (10 by default), from a detached
+process so the session never waits on it, all into one document per session,
 `session:<session_id>`. It reaches the memory service through an MCP door on an
 OpenAI-compatible gateway, using a key kept in a file. Installing the plugin
 does not turn it on. The plugin registers no hook, and the scripts do nothing
@@ -113,8 +114,9 @@ Before wiring it in, the user needs:
    }
    ```
 
-   `async` keeps the agent from waiting on the network. The hook enforces its
-   own 15-second deadline on each exchange.
+   The hook only reads the session file; when a batch is due it starts a
+   detached worker that does the sending, with its own 15-second deadline on
+   each exchange. `async` is a second guard against the agent ever waiting.
 
 5. For Codex, add a `Stop` hook to `~/.codex/config.toml`, then trust it once
    in `/hooks`:
@@ -125,16 +127,18 @@ Before wiring it in, the user needs:
    [[hooks.Stop.hooks]]
    type = "command"
    command = "<python> -S -I <home>/.claude/hooks/transcript_capture_codex.py"
-   timeout = 60
+   timeout = 10
    ```
 
+   Codex waits for a hook to finish, so the short timeout is only a bound:
+   the hook reads and returns, and the sending happens in the worker.
    The same entry can also go in `~/.codex/hooks.json` as
-   `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 60}]}]}}`.
+   `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 10}]}]}}`.
    Check the hooks page of the installed Codex version for the exact form.
 
-6. Schedule the catch-up. It sends the last turns of sessions that ended
-   without another Stop, and replays retains that failed. Run it nightly, or
-   hourly; a run with nothing to do is cheap.
+6. Optionally, schedule the catch-up. The hook sends full batches only, so
+   the last turns of a session (fewer than `interval_turns`) wait for a
+   catch-up. Run it nightly, or hourly; a run with nothing to do is cheap.
 
    Windows Task Scheduler (one task per harness):
 
@@ -154,8 +158,8 @@ Before wiring it in, the user needs:
    capture first ran on the device. To send older history on purpose, run the
    catch-up once with `--backfill`, after a `--dry-run --backfill` preview.
 
-Retains that fail go to `~/.claude/transcript-capture/owed-<date>.jsonl`,
-and the next catch-up sends them, as does
+Retains that fail go to `~/.claude/transcript-capture/owed-<date>.jsonl`.
+The next worker that reaches the door sends them, and so do a catch-up and
 `transcript_capture.py --replay-owed`. To turn capture off, set
 `enabled` to false. To remove it, also delete the hook entries and the
 scheduled tasks.
